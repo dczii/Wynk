@@ -30,6 +30,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -38,6 +39,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
+import androidx.lifecycle.lifecycleScope
+import com.meta.wearable.dat.core.Wearables
+import com.meta.wearable.dat.core.types.Permission
+import com.meta.wearable.dat.core.types.PermissionStatus
+import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -56,12 +65,32 @@ class MainActivity : ComponentActivity() {
         }
       }
 
+  // The glasses camera permission is granted by you in the Meta AI app, not by Android.
+  private val cameraPermission =
+      registerForActivityResult(Wearables.RequestPermissionContract()) { result ->
+        if (result.getOrNull() == PermissionStatus.Granted) {
+          vm.capture()
+        } else {
+          Toast.makeText(this, "Glasses camera permission was not granted", Toast.LENGTH_LONG)
+              .show()
+        }
+      }
+
+  /** Checks the glasses camera permission, asks for it if needed, then captures. */
+  fun captureWithPermission() {
+    lifecycleScope.launch {
+      val status = Wearables.checkPermissionStatus(Permission.CAMERA).getOrNull()
+      if (status == PermissionStatus.Granted) vm.capture()
+      else cameraPermission.launch(Permission.CAMERA)
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
     setContent {
       MaterialTheme(colorScheme = darkColorScheme()) {
-        Surface(modifier = Modifier.fillMaxSize()) { Screen(vm, this) }
+        Surface(modifier = Modifier.fillMaxSize()) { Screen(vm, this) { captureWithPermission() } }
       }
     }
   }
@@ -73,9 +102,10 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun Screen(vm: GlassesViewModel, activity: ComponentActivity) {
+private fun Screen(vm: GlassesViewModel, activity: ComponentActivity, onCapture: () -> Unit) {
   val ui by vm.ui.collectAsStateWithLifecycle()
   val sim by vm.simGlasses.collectAsStateWithLifecycle()
+  val photo by vm.photo.collectAsStateWithLifecycle()
   val registered = ui.registrationState == RegistrationState.REGISTERED
   val running = ui.sessionState != null
 
@@ -132,6 +162,33 @@ private fun Screen(vm: GlassesViewModel, activity: ComponentActivity) {
     }
     OutlinedButton(onClick = { vm.stop() }, enabled = running, modifier = Modifier.fillMaxWidth()) {
       Text("Stop session")
+    }
+
+    Spacer(Modifier)
+    Text("Practice mode", style = MaterialTheme.typography.titleMedium)
+    Button(
+        onClick = onCapture,
+        enabled = !ui.useSimulator && registered && !ui.capturing,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+      Text(if (ui.capturing) "Capturing…" else "Capture problem")
+    }
+    if (ui.capturing) {
+      val p = ui.captureProgress
+      if (p != null) LinearProgressIndicator(progress = { p.toFloat() }, modifier = Modifier.fillMaxWidth())
+      else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+    }
+    photo?.let { p ->
+      Text(
+          "Last photo: ${p.bitmap.width}×${p.bitmap.height}, ${p.bytes / 1024} KB",
+          style = MaterialTheme.typography.bodySmall,
+      )
+      Image(
+          bitmap = p.bitmap.asImageBitmap(),
+          contentDescription = "Photo from the glasses camera",
+          contentScale = ContentScale.FillWidth,
+          modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+      )
     }
 
     val kit = sim?.services?.display

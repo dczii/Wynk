@@ -59,6 +59,7 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.material3)
   implementation(libs.mwdat.core)
+  implementation(libs.mwdat.camera)
   implementation(libs.mwdat.display)
   implementation(libs.mwdat.mockdevice)
 }
