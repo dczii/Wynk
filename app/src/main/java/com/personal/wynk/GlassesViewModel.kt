@@ -77,6 +77,18 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     viewModelScope.launch {
       Wearables.devices.collect { d -> _ui.update { it.copy(deviceCount = d.size) } }
     }
+    // Logs link state, compatibility and display capability whenever a device changes.
+    // Handy when createSession says "No eligible device available".
+    viewModelScope.launch {
+      val last = mutableMapOf<String, String>()
+      while (true) {
+        Wearables.devicesMetadata.forEach { (id, flow) ->
+          val line = "${flow.value} displayCapable=${flow.value.isDisplayCapable()}"
+          if (last.put(id.toString(), line) != line) Log.i(TAG, "Device $id: $line")
+        }
+        kotlinx.coroutines.delay(2_000)
+      }
+    }
     viewModelScope.launch {
       Wearables.registrationErrorStream.collect { e ->
         status("Registration error: ${e.getLocalizedDescription(getApplication())}")

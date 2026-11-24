@@ -40,6 +40,12 @@ Or open the folder in Android Studio and press Run.
    a button, and tap to press it.
 4. **End it.** A two-finger tap on the temple (Back), or **Stop session**, ends the session.
 
+**If it doesn't connect:**
+- *Meta AI says "Error opening link"*: turn on Developer Mode in Meta AI, then force-close Meta AI.
+- *"Registration process failed"*: check that Bluetooth is on and that Meta AI shows the glasses as connected.
+- *"No eligible device available"*: the glasses link is still coming up. Wait a few seconds and try
+  again; the `Wynk` logcat tag prints each device's link state.
+
 **Without the glasses:** turn on **Use simulated glasses**, then tap **Show on glasses**. The
 600×600 display renders inside the phone app.
 
