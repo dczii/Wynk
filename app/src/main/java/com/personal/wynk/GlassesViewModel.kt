@@ -563,7 +563,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
     send {
       flexBox(direction = Direction.COLUMN, gap = 12) {
-        flexBox(padding = 24, gap = 8, background = FlexBoxBackground.CARD) {
+        flexBox(padding = 20, gap = 6, background = FlexBoxBackground.CARD) {
           when {
             question == null -> {
               text("Grok", style = TextStyle.HEADING)
@@ -630,7 +630,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     val p = _pendingPhoto.value ?: return showChat()
     send {
       flexBox(direction = Direction.COLUMN, gap = 12) {
-        flexBox(padding = 24, gap = 8, background = FlexBoxBackground.CARD) {
+        flexBox(padding = 20, gap = 6, background = FlexBoxBackground.CARD) {
           text("Photo ready", style = TextStyle.HEADING)
           text("Send it to Grok, or add a question on your phone.", style = TextStyle.BODY)
           text("${p.width}×${p.height}", style = TextStyle.META, color = TextColor.SECONDARY)
@@ -662,13 +662,17 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     }
   }
 
-  private fun oneLine(text: String, max: Int = 44): String {
+  private fun oneLine(text: String, max: Int = 34): String {
     val flat = text.replace(Regex("\\s+"), " ").trim()
     return if (flat.length <= max) flat else flat.take(max - 1).trimEnd() + "…"
   }
 
-  /** Splits a reply into pages of whole words that fit the card (about 8 lines). */
-  private fun pages(text: String, max: Int = 230): List<String> {
+  /**
+   * Splits a reply into pages of whole words. The real glasses draw text larger than the
+   * simulator, and a taller card pushes the buttons off the bottom of the display, so pages stay
+   * short (about 4 lines).
+   */
+  private fun pages(text: String, max: Int = 130): List<String> {
     val out = mutableListOf<String>()
     val page = StringBuilder()
     for (word in text.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
