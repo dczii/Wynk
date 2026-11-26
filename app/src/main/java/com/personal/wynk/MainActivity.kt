@@ -3,6 +3,7 @@ package com.personal.wynk
 import android.Manifest.permission.BLUETOOTH
 import android.Manifest.permission.BLUETOOTH_CONNECT
 import android.Manifest.permission.INTERNET
+import android.Manifest.permission.RECORD_AUDIO
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.os.Bundle
@@ -13,6 +14,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
 import androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions
+import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -104,6 +106,17 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  private val micPermission =
+      registerForActivityResult(RequestPermission()) { granted ->
+        if (granted) vm.startListening()
+        else Toast.makeText(this, "Microphone permission is needed to speak", Toast.LENGTH_LONG).show()
+      }
+
+  /** Asks for the mic permission if needed, then starts listening. */
+  fun speakWithPermission() {
+    if (vm.hasMicPermission()) vm.startListening() else micPermission.launch(RECORD_AUDIO)
+  }
+
   // Android photo picker; no storage permission needed.
   private val gallery =
       registerForActivityResult(PickVisualMedia()) { uri ->
@@ -140,7 +153,7 @@ class MainActivity : ComponentActivity() {
     enableEdgeToEdge()
     setContent {
       MaterialTheme(colorScheme = darkColorScheme()) {
-        Surface(modifier = Modifier.fillMaxSize()) { Screen(vm, this, ::captureWithPermission, ::pickFromGallery) }
+        Surface(modifier = Modifier.fillMaxSize()) { Screen(vm, this, ::captureWithPermission, ::pickFromGallery, ::speakWithPermission) }
       }
     }
   }
@@ -157,6 +170,7 @@ private fun Screen(
     activity: ComponentActivity,
     onCapture: () -> Unit,
     onGallery: () -> Unit,
+    onSpeak: () -> Unit,
 ) {
   val ui by vm.ui.collectAsStateWithLifecycle()
   val chat by vm.chat.collectAsStateWithLifecycle()
@@ -219,6 +233,9 @@ private fun Screen(
         onStop = { vm.stopReply() },
         onCapture = onCapture,
         onGallery = onGallery,
+        onSpeak = onSpeak,
+        onFinishSpeaking = { vm.finishListening() },
+        onCancelSpeaking = { vm.cancelListening() },
         onRemovePhoto = { vm.setPendingPhoto(null) },
     )
   }
@@ -273,6 +290,9 @@ private fun Composer(
     onStop: () -> Unit,
     onCapture: () -> Unit,
     onGallery: () -> Unit,
+    onSpeak: () -> Unit,
+    onFinishSpeaking: () -> Unit,
+    onCancelSpeaking: () -> Unit,
     onRemovePhoto: () -> Unit,
 ) {
   Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -294,15 +314,41 @@ private fun Composer(
         TextButton(onClick = onRemovePhoto) { Text("Remove") }
       }
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      OutlinedButton(
-          onClick = onCapture,
-          enabled = !ui.useSimulator && registered && !ui.capturing,
-          modifier = Modifier.weight(1f),
-      ) {
-        Text(if (ui.capturing) "Capturing…" else "Glasses photo")
+    when {
+      ui.listening -> {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          Text(
+              "Listening… ${ui.listenSeconds}s · ${if (ui.usingGlassesMic) "glasses mic" else "phone mic"}",
+              color = MaterialTheme.colorScheme.primary,
+              modifier = Modifier.weight(1f),
+          )
+          OutlinedButton(onClick = onCancelSpeaking) { Text("Cancel") }
+          Button(onClick = onFinishSpeaking) { Text("Send") }
+        }
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
       }
-      OutlinedButton(onClick = onGallery, modifier = Modifier.weight(1f)) { Text("Gallery") }
+      ui.transcribing -> {
+        Text("Turning your words into text…", color = MaterialTheme.colorScheme.primary)
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+      }
+      else ->
+          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = onCapture,
+                enabled = !ui.useSimulator && registered && !ui.capturing,
+                modifier = Modifier.weight(1f),
+            ) {
+              Text(if (ui.capturing) "Capturing…" else "Photo")
+            }
+            OutlinedButton(onClick = onGallery, modifier = Modifier.weight(1f)) { Text("Gallery") }
+            Button(
+                onClick = onSpeak,
+                enabled = !ui.thinking && !ui.capturing,
+                modifier = Modifier.weight(1f),
+            ) {
+              Text("Speak")
+            }
+          }
     }
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       OutlinedTextField(

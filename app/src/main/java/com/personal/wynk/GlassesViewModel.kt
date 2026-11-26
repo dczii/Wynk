@@ -69,6 +69,11 @@ data class UiState(
     val capturing: Boolean = false,
     val captureProgress: Double? = null,
     val thinking: Boolean = false,
+    /** Recording speech; [listenSeconds] counts up while it does. */
+    val listening: Boolean = false,
+    val listenSeconds: Int = 0,
+    val usingGlassesMic: Boolean = false,
+    val transcribing: Boolean = false,
     val status: String = "Idle",
 )
 
@@ -128,6 +133,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
   val pendingPhoto: StateFlow<Bitmap?> = _pendingPhoto.asStateFlow()
 
   private val grok = GrokClient(BuildConfig.XAI_API_KEY)
+  private val recorder = VoiceRecorder(application)
+  private var listenJob: Job? = null
+  @Volatile private var keepListening = false
+  @Volatile private var listenCancelled = false
   private var replyJob: Job? = null
   private var nextId = 0L
 
@@ -400,6 +409,121 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     status("Photo captured (${bitmap.width}×${bitmap.height}, ${bytes.size / 1024} KB)")
   }
 
+  // ---- Voice ----
+
+  fun hasMicPermission() = recorder.hasPermission()
+
+  /**
+   * Records from the glasses mic until [finishListening] (Send) or [cancelListening], then sends
+   * the transcript to Grok with the pending photo, if any. The phone asks for the mic permission
+   * first (MainActivity); from the glasses, a missing permission shows a hint instead.
+   */
+  fun startListening() {
+    val ui = _ui.value
+    if (ui.listening || ui.transcribing || ui.thinking || ui.capturing) return
+    if (!recorder.hasPermission()) {
+      status("Allow the microphone: tap Speak in Wynk on your phone")
+      return
+    }
+    keepListening = true
+    listenCancelled = false
+    _ui.update { it.copy(listening = true, listenSeconds = 0, usingGlassesMic = false) }
+    val screenBefore = currentScreen
+    currentScreen = ::showListening
+
+    listenJob =
+        viewModelScope.launch {
+          // Bring the glasses session and display up before the mic: starting a session while
+          // the Bluetooth voice link is switching over fails with "No eligible device".
+          prepareGlassesDisplay()
+          refreshGlasses(now = true)
+          val ticker = launch {
+            while (true) {
+              delay(1_000)
+              _ui.update { it.copy(listenSeconds = it.listenSeconds + 1) }
+              refreshGlasses()
+            }
+          }
+          val wav =
+              try {
+                recorder.record(
+                    keepGoing = { keepListening },
+                    onStart = { glasses ->
+                      _ui.update { it.copy(usingGlassesMic = glasses) }
+                      status(if (glasses) "Listening (glasses mic)" else "Listening (phone mic)")
+                      refreshGlasses(now = true)
+                    },
+                )
+              } catch (e: Exception) {
+                Log.e(TAG, "Recording failed", e)
+                null
+              } finally {
+                ticker.cancel()
+                _ui.update { it.copy(listening = false) }
+              }
+
+          if (listenCancelled) {
+            status("Cancelled")
+            currentScreen = screenBefore
+            refreshGlasses(now = true)
+            return@launch
+          }
+          if (wav == null || wav.size < 44 + 16_000) { // under half a second of audio
+            status(if (wav == null) "Could not start the microphone" else "Too short, try again")
+            currentScreen = screenBefore
+            refreshGlasses(now = true)
+            return@launch
+          }
+
+          _ui.update { it.copy(transcribing = true) }
+          refreshGlasses(now = true)
+          val text =
+              try {
+                val started = System.currentTimeMillis()
+                grok.transcribe(wav).also {
+                  Log.i(
+                      TAG,
+                      "Transcribed ${wav.size / 1024} KB in " +
+                          "${System.currentTimeMillis() - started} ms: \"$it\"")
+                }
+              } catch (e: Exception) {
+                Log.e(TAG, "Transcription failed", e)
+                status(e.message ?: "Speech-to-text failed")
+                null
+              } finally {
+                _ui.update { it.copy(transcribing = false) }
+              }
+
+          if (text.isNullOrBlank()) {
+            if (text != null) status("Didn't catch that, try again")
+            currentScreen = screenBefore
+            refreshGlasses(now = true)
+          } else {
+            sendMessage(text)
+          }
+        }
+  }
+
+  /** Starts a session and display if the glasses are usable, and waits for the display. */
+  private suspend fun prepareGlassesDisplay() {
+    val usable =
+        _ui.value.useSimulator || _ui.value.registrationState == RegistrationState.REGISTERED
+    if (!usable || display != null) return
+    val s = ensureSession() ?: return
+    attachDisplay(s)
+    withTimeoutOrNull(5_000) { _ui.first { it.displayState == DisplayState.STARTED } }
+  }
+
+  /** Stops recording and sends what was said. */
+  fun finishListening() {
+    keepListening = false
+  }
+
+  fun cancelListening() {
+    listenCancelled = true
+    keepListening = false
+  }
+
   // ---- Chat with Grok ----
 
   /** Attaches a photo (e.g. from the gallery) to the next message. */
@@ -568,8 +692,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             question == null -> {
               text("Grok", style = TextStyle.HEADING)
               text(
-                  if (canPhoto) "Tap Photo to ask about what you see, or type on your phone."
-                  else "Type a message on your phone.",
+                  if (canPhoto) "Tap Speak to ask, or Photo to ask about what you see."
+                  else "Tap Speak to ask, or type on your phone.",
                   style = TextStyle.BODY,
               )
             }
@@ -605,13 +729,14 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             if (streaming) {
               button("Stop", style = ButtonStyle.SECONDARY, onClick = { stopReply() })
             } else {
+              button("Speak", style = ButtonStyle.PRIMARY, onClick = { startListening() })
               if (canPhoto) {
-                button("Photo", style = ButtonStyle.PRIMARY, onClick = { capture() })
+                button("Photo", style = ButtonStyle.SECONDARY, onClick = { capture() })
               }
               if (pages.size > 1) {
                 button(
                     if (replyPage == pages.size - 1) "From start" else "More",
-                    style = if (canPhoto) ButtonStyle.SECONDARY else ButtonStyle.PRIMARY,
+                    style = ButtonStyle.SECONDARY,
                     onClick = {
                       replyPage = (replyPage + 1) % pages.size
                       refreshGlasses(now = true)
@@ -632,7 +757,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
       flexBox(direction = Direction.COLUMN, gap = 12) {
         flexBox(padding = 20, gap = 6, background = FlexBoxBackground.CARD) {
           text("Photo ready", style = TextStyle.HEADING)
-          text("Send it to Grok, or add a question on your phone.", style = TextStyle.BODY)
+          text("Ask a question about it, or just send it.", style = TextStyle.BODY)
           text("${p.width}×${p.height}", style = TextStyle.META, color = TextColor.SECONDARY)
         }
         flexBox(
@@ -641,12 +766,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             crossAlignment = Alignment.CENTER,
         ) {
           buttonGroup {
-            button(
-                "Send",
-                style = ButtonStyle.PRIMARY,
-                iconName = IconName.CHECKMARK,
-                onClick = { sendMessage("") },
-            )
+            button("Ask", style = ButtonStyle.PRIMARY, onClick = { startListening() })
+            button("Send", style = ButtonStyle.SECONDARY, onClick = { sendMessage("") })
             button(
                 "Discard",
                 style = ButtonStyle.SECONDARY,
@@ -656,6 +777,50 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
                   refreshGlasses(now = true)
                 },
             )
+          }
+        }
+      }
+    }
+  }
+
+  /** While recording, then while the speech is turned into text. */
+  private fun showListening() {
+    val ui = _ui.value
+    send {
+      flexBox(direction = Direction.COLUMN, gap = 12) {
+        flexBox(padding = 20, gap = 6, background = FlexBoxBackground.CARD) {
+          if (ui.transcribing) {
+            text("Got it", style = TextStyle.HEADING)
+            text("Turning your words into text…", style = TextStyle.BODY)
+          } else {
+            text("Listening… ${ui.listenSeconds}s", style = TextStyle.HEADING)
+            text(
+                if (_pendingPhoto.value != null) "Ask about your photo, then tap Send."
+                else "Speak, then tap Send.",
+                style = TextStyle.BODY,
+            )
+            text(
+                if (ui.usingGlassesMic) "Glasses mic" else "Phone mic",
+                style = TextStyle.META,
+                color = TextColor.SECONDARY,
+            )
+          }
+        }
+        if (!ui.transcribing) {
+          flexBox(
+              direction = Direction.ROW,
+              alignment = Alignment.CENTER,
+              crossAlignment = Alignment.CENTER,
+          ) {
+            buttonGroup {
+              button(
+                  "Send",
+                  style = ButtonStyle.PRIMARY,
+                  iconName = IconName.CHECKMARK,
+                  onClick = { finishListening() },
+              )
+              button("Cancel", style = ButtonStyle.SECONDARY, onClick = { cancelListening() })
+            }
           }
         }
       }

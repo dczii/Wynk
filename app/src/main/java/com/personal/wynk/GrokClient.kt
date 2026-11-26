@@ -75,6 +75,44 @@ class GrokClient(
         }
       }
 
+  /** Speech-to-text: POST /v1/stt (multipart). Returns the transcript, possibly empty. */
+  suspend fun transcribe(wav: ByteArray): String =
+      withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) throw GrokException("No xai_api_key in local.properties")
+        val boundary = "wynk-${System.currentTimeMillis()}"
+        val conn = URL("$BASE/stt").openConnection() as HttpURLConnection
+        try {
+          conn.requestMethod = "POST"
+          conn.connectTimeout = 15_000
+          conn.readTimeout = 30_000
+          conn.doOutput = true
+          conn.setRequestProperty("Authorization", "Bearer $apiKey")
+          conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+          conn.outputStream.use { out ->
+            // Option fields must come before the file field.
+            out.write(
+                ("--$boundary\r\n" +
+                        "Content-Disposition: form-data; name=\"model\"\r\n\r\n" +
+                        "$STT_MODEL\r\n" +
+                        "--$boundary\r\n" +
+                        "Content-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n" +
+                        "Content-Type: audio/wav\r\n\r\n")
+                    .toByteArray())
+            out.write(wav)
+            out.write("\r\n--$boundary--\r\n".toByteArray())
+          }
+          val code = conn.responseCode
+          if (code !in 200..299) {
+            val err = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            throw GrokException("Speech-to-text error $code: ${errorMessage(err)}")
+          }
+          val body = conn.inputStream.bufferedReader().use { it.readText() }
+          JSONObject(body).optString("text").trim()
+        } finally {
+          conn.disconnect()
+        }
+      }
+
   private fun errorMessage(body: String): String =
       runCatching {
             val o = JSONObject(body)
@@ -87,5 +125,6 @@ class GrokClient(
 
   companion object {
     private const val BASE = "https://api.x.ai/v1"
+    private const val STT_MODEL = "grok-voice-transcribe-2.0"
   }
 }
