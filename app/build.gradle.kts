@@ -34,6 +34,11 @@ android {
         localProperties.getProperty("mwdat_application_id", "0")
     manifestPlaceholders["mwdat_client_token"] =
         localProperties.getProperty("mwdat_client_token", "0")
+
+    // xAI key for Grok. Lives in local.properties (gitignored). It is embedded in the APK,
+    // so never share the APK.
+    buildConfigField(
+        "String", "XAI_API_KEY", "\"${localProperties.getProperty("xai_api_key", "")}\"")
   }
 
   buildTypes {

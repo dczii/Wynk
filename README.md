@@ -31,6 +31,16 @@ cd ~/Projects/glasses-app && ./gradlew installDebug
 
 Or open the folder in Android Studio and press Run.
 
+## Grok key
+
+Wynk chats with Grok through the xAI API. Add your key to `local.properties` (gitignored):
+
+```properties
+xai_api_key=xai-...
+```
+
+The key is built into the APK, so don't share the APK.
+
 ## Use it
 
 1. **Grant Bluetooth.** Open **Wynk** and allow the Bluetooth permission.

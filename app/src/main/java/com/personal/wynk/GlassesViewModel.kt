@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Base64
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -36,6 +37,7 @@ import com.meta.wearable.dat.display.views.TextStyle
 import com.meta.wearable.dat.mockdevice.MockDeviceKit
 import com.meta.wearable.dat.mockdevice.api.GlassesModel
 import com.meta.wearable.dat.mockdevice.api.MockGlasses
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -52,6 +54,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CancellationException
+import org.json.JSONArray
+import org.json.JSONObject
 
 private const val TAG = "Wynk"
 
@@ -64,11 +69,38 @@ data class UiState(
     val tapCount: Int = 0,
     val capturing: Boolean = false,
     val captureProgress: Double? = null,
+    val thinking: Boolean = false,
     val status: String = "Idle",
 )
 
 /** The last photo taken with the glasses camera. */
 data class CapturedPhoto(val bitmap: Bitmap, val bytes: Int, val millis: Long)
+
+enum class Role {
+  USER,
+  ASSISTANT,
+}
+
+/** One chat bubble. [image] is set on user messages that carried a photo. */
+data class ChatMessage(
+    val id: Long,
+    val role: Role,
+    val text: String,
+    val image: Bitmap? = null,
+    val streaming: Boolean = false,
+    val failed: Boolean = false,
+)
+
+/** Keeps replies readable on the 600×600 glasses display. */
+private const val SYSTEM_PROMPT =
+    "You are Grok, talking to the user through Wynk, an app that shows your replies on Meta " +
+        "Ray-Ban Display glasses with a small 600x600 screen. The user talks to you by voice or " +
+        "by sending a photo from the glasses camera. Reply in plain text only: no markdown, " +
+        "no headings, no bullet symbols, no tables, no emoji. Keep replies to about 60 words " +
+        "unless the user asks for more detail. Only write code when asked, and keep code lines " +
+        "short. When a photo is unclear, say what you can see and ask for a closer shot."
+
+private const val DEFAULT_PHOTO_PROMPT = "What's in this photo?"
 
 /**
  * Display and camera flows, following Meta's DisplayAccess and CameraAccess samples:
@@ -87,6 +119,18 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
   private val _photo = MutableStateFlow<CapturedPhoto?>(null)
   val photo: StateFlow<CapturedPhoto?> = _photo.asStateFlow()
+
+  private val _chat = MutableStateFlow<List<ChatMessage>>(emptyList())
+  /** The conversation, oldest first. The phone is the source of truth. */
+  val chat: StateFlow<List<ChatMessage>> = _chat.asStateFlow()
+
+  private val _pendingPhoto = MutableStateFlow<Bitmap?>(null)
+  /** A photo waiting to go out with the next message (from the glasses or the gallery). */
+  val pendingPhoto: StateFlow<Bitmap?> = _pendingPhoto.asStateFlow()
+
+  private val grok = GrokClient(BuildConfig.XAI_API_KEY)
+  private var replyJob: Job? = null
+  private var nextId = 0L
 
   private var initialized = false
   private var session: DeviceSession? = null
@@ -339,13 +383,127 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
       status("Got ${bytes.size / 1024} KB but could not decode it")
       return
     }
-    // Keep the original bytes for the next phase (sending to Claude).
+    // Keep the original bytes on disk for debugging.
     withContext(Dispatchers.IO) {
       File(getApplication<Application>().filesDir, "last_capture.img").writeBytes(bytes)
     }
     _photo.value = CapturedPhoto(bitmap, bytes.size, System.currentTimeMillis())
+    _pendingPhoto.value = bitmap
     Log.i(TAG, "Photo: ${bitmap.width}x${bitmap.height}, ${bytes.size} bytes")
     status("Photo captured (${bitmap.width}×${bitmap.height}, ${bytes.size / 1024} KB)")
+  }
+
+  // ---- Chat with Grok ----
+
+  /** Attaches a photo (e.g. from the gallery) to the next message. */
+  fun setPendingPhoto(bitmap: Bitmap?) {
+    _pendingPhoto.value = bitmap
+  }
+
+  /**
+   * Sends [text] (plus the pending photo, if any) and streams Grok's reply into the chat. With a
+   * photo and no text, asks the default photo question.
+   */
+  fun sendMessage(text: String) {
+    if (_ui.value.thinking) return
+    val image = _pendingPhoto.value
+    val prompt = text.trim().ifEmpty { if (image != null) DEFAULT_PHOTO_PROMPT else return }
+    _pendingPhoto.value = null
+
+    val user = ChatMessage(nextId++, Role.USER, prompt, image)
+    val replyId = nextId++
+    _chat.update { it + user + ChatMessage(replyId, Role.ASSISTANT, "", streaming = true) }
+    _ui.update { it.copy(thinking = true) }
+
+    replyJob =
+        viewModelScope.launch {
+          try {
+            val request = withContext(Dispatchers.Default) { buildRequest() }
+            val started = System.currentTimeMillis()
+            grok.stream(request) { delta -> editReply(replyId) { it.copy(text = it.text + delta) } }
+            Log.i(TAG, "Grok replied in ${System.currentTimeMillis() - started} ms")
+            editReply(replyId) { it.copy(streaming = false) }
+          } catch (e: CancellationException) {
+            editReply(replyId) {
+              it.copy(text = it.text.ifEmpty { "(stopped)" }, streaming = false)
+            }
+            throw e
+          } catch (e: Exception) {
+            Log.e(TAG, "Grok failed", e)
+            editReply(replyId) {
+              it.copy(text = e.message ?: "Grok request failed", streaming = false, failed = true)
+            }
+          } finally {
+            _ui.update { it.copy(thinking = false) }
+          }
+        }
+  }
+
+  fun stopReply() {
+    replyJob?.cancel()
+  }
+
+  fun newChat() {
+    replyJob?.cancel()
+    _chat.value = emptyList()
+    _pendingPhoto.value = null
+  }
+
+  private fun editReply(id: Long, change: (ChatMessage) -> ChatMessage) {
+    _chat.update { list -> list.map { if (it.id == id) change(it) else it } }
+  }
+
+  /**
+   * System prompt + history. Only the newest photo goes as an image; earlier ones become the text
+   * "[photo]" so each request stays small. Failed replies and the empty in-progress reply are left
+   * out.
+   */
+  private fun buildRequest(): JSONArray {
+    val history = _chat.value.filter { !it.failed && !(it.role == Role.ASSISTANT && it.streaming) }
+    val newestPhotoId = history.lastOrNull { it.image != null }?.id
+    val messages = JSONArray().put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
+    for (m in history) {
+      if (m.role == Role.ASSISTANT) {
+        if (m.text.isNotBlank()) {
+          messages.put(JSONObject().put("role", "assistant").put("content", m.text))
+        }
+        continue
+      }
+      val content: Any =
+          when {
+            m.image != null && m.id == newestPhotoId ->
+                JSONArray()
+                    .put(
+                        JSONObject()
+                            .put("type", "image_url")
+                            .put(
+                                "image_url",
+                                JSONObject()
+                                    .put("url", "data:image/jpeg;base64,${jpegBase64(m.image)}")
+                                    .put("detail", "high")))
+                    .put(JSONObject().put("type", "text").put("text", m.text))
+            m.image != null -> "[photo] ${m.text}"
+            else -> m.text
+          }
+      messages.put(JSONObject().put("role", "user").put("content", content))
+    }
+    return messages
+  }
+
+  /** JPEG, long side at most 1568 px, base64 without line breaks. */
+  private fun jpegBase64(bitmap: Bitmap): String {
+    val longSide = maxOf(bitmap.width, bitmap.height)
+    val scaled =
+        if (longSide <= 1568) bitmap
+        else {
+          val f = 1568f / longSide
+          Bitmap.createScaledBitmap(
+              bitmap, (bitmap.width * f).toInt(), (bitmap.height * f).toInt(), true)
+        }
+    val out = ByteArrayOutputStream()
+    scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+    Log.i(TAG, "Photo for Grok: ${scaled.width}x${scaled.height}, ${out.size() / 1024} KB")
+    return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
   }
 
   // ---- What appears on the glasses. Every send replaces the whole screen. ----
@@ -403,7 +561,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
               style = TextStyle.BODY,
           )
           text(
-              "Next phase: Claude reads it and sends hints here",
+              "Send it to Grok from the phone",
               style = TextStyle.META,
               color = TextColor.SECONDARY,
           )
