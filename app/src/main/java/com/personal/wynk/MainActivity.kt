@@ -368,7 +368,7 @@ private fun GlassesPanel(vm: GlassesViewModel, activity: ComponentActivity) {
         enabled = ui.useSimulator || registered,
         modifier = Modifier.fillMaxWidth(),
     ) {
-      Text(if (running) "Re-send screen" else "Show on glasses")
+      Text(if (running) "Refresh glasses" else "Show chat on glasses")
     }
     OutlinedButton(onClick = { vm.stop() }, enabled = running, modifier = Modifier.fillMaxWidth()) {
       Text("Stop session")

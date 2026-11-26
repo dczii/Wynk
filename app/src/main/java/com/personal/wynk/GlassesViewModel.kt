@@ -66,7 +66,6 @@ data class UiState(
     val sessionState: DeviceSessionState? = null,
     val displayState: DisplayState? = null,
     val useSimulator: Boolean = false,
-    val tapCount: Int = 0,
     val capturing: Boolean = false,
     val captureProgress: Double? = null,
     val thinking: Boolean = false,
@@ -138,8 +137,13 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
   private var displayJob: Job? = null
   private val sessionJobs = mutableListOf<Job>()
 
-  /** What to draw whenever the display (re)starts. */
-  private var currentScreen: () -> Unit = ::showHello
+  /** What to draw whenever the display (re)starts or the chat changes. */
+  private var currentScreen: () -> Unit = ::showChat
+
+  /** Which page of the latest reply the glasses show. */
+  private var replyPage = 0
+  private var refreshJob: Job? = null
+  private var lastScreenAt = 0L
 
   /** Call once Bluetooth permissions are granted. */
   fun initialize() {
@@ -270,7 +274,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
               viewModelScope.launch {
                 d.state.collect { state ->
                   _ui.update { it.copy(displayState = state) }
-                  if (state == DisplayState.STARTED) currentScreen()
+                  if (state == DisplayState.STARTED) {
+                    status("Showing on glasses")
+                    currentScreen()
+                  }
                 }
               }
         }
@@ -305,7 +312,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         if (data != null) onPhoto(data)
 
         if (hadDisplay || data != null) {
-          currentScreen = if (data != null) ::showCaptured else currentScreen
+          currentScreen = if (data != null) ::showPhotoReady else ::showChat
           attachDisplay(s)
         }
       } finally {
@@ -414,13 +421,19 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     val replyId = nextId++
     _chat.update { it + user + ChatMessage(replyId, Role.ASSISTANT, "", streaming = true) }
     _ui.update { it.copy(thinking = true) }
+    currentScreen = ::showChat
+    replyPage = 0
+    showOnGlasses()
 
     replyJob =
         viewModelScope.launch {
           try {
             val request = withContext(Dispatchers.Default) { buildRequest() }
             val started = System.currentTimeMillis()
-            grok.stream(request) { delta -> editReply(replyId) { it.copy(text = it.text + delta) } }
+            grok.stream(request) { delta ->
+              editReply(replyId) { it.copy(text = it.text + delta) }
+              refreshGlasses()
+            }
             Log.i(TAG, "Grok replied in ${System.currentTimeMillis() - started} ms")
             editReply(replyId) { it.copy(streaming = false) }
           } catch (e: CancellationException) {
@@ -435,6 +448,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             }
           } finally {
             _ui.update { it.copy(thinking = false) }
+            refreshGlasses(now = true)
           }
         }
   }
@@ -447,6 +461,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     replyJob?.cancel()
     _chat.value = emptyList()
     _pendingPhoto.value = null
+    currentScreen = ::showChat
+    refreshGlasses(now = true)
   }
 
   private fun editReply(id: Long, change: (ChatMessage) -> ChatMessage) {
@@ -508,40 +524,137 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
   // ---- What appears on the glasses. Every send replaces the whole screen. ----
 
-  private fun showHello() {
-    val count = _ui.value.tapCount
-    val time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
+  /**
+   * Shows the chat on the glasses when they are usable (registered, or the simulator is on),
+   * starting a session if there isn't one.
+   */
+  private fun showOnGlasses() {
+    val usable =
+        _ui.value.useSimulator || _ui.value.registrationState == RegistrationState.REGISTERED
+    if (!usable) return
+    if (display != null) refreshGlasses(now = true) else start()
+  }
+
+  /**
+   * Redraws the current screen. Streaming deltas call this many times a second, so sends are
+   * limited to one per second; [now] skips the wait (for button presses and finished replies).
+   */
+  private fun refreshGlasses(now: Boolean = false) {
+    if (display == null) return
+    if (now) refreshJob?.cancel() else if (refreshJob?.isActive == true) return
+    val wait = if (now) 0L else (lastScreenAt + 1_000 - System.currentTimeMillis()).coerceAtLeast(0)
+    refreshJob =
+        viewModelScope.launch {
+          delay(wait)
+          lastScreenAt = System.currentTimeMillis()
+          currentScreen()
+        }
+  }
+
+  /** The latest exchange: your last message on one line, then a page of Grok's reply. */
+  private fun showChat() {
+    val chat = _chat.value
+    val reply = chat.lastOrNull { it.role == Role.ASSISTANT }
+    val question = chat.lastOrNull { it.role == Role.USER }
+    val streaming = reply?.streaming == true
+    val pages = if (reply == null || reply.text.isEmpty()) emptyList() else pages(reply.text)
+    if (replyPage >= pages.size) replyPage = 0
+    val canPhoto = !_ui.value.useSimulator && !_ui.value.capturing
+
     send {
       flexBox(direction = Direction.COLUMN, gap = 12) {
-        flexBox(padding = 24, background = FlexBoxBackground.CARD) {
-          text("Hello from Wynk", style = TextStyle.HEADING)
-          text("It's $time. Taps so far: $count", style = TextStyle.BODY)
-          text(
-              "Swipe to pick a button, tap to press it",
-              style = TextStyle.META,
-              color = TextColor.SECONDARY,
-          )
+        flexBox(padding = 24, gap = 8, background = FlexBoxBackground.CARD) {
+          when {
+            question == null -> {
+              text("Grok", style = TextStyle.HEADING)
+              text(
+                  if (canPhoto) "Tap Photo to ask about what you see, or type on your phone."
+                  else "Type a message on your phone.",
+                  style = TextStyle.BODY,
+              )
+            }
+            else -> {
+              text(
+                  oneLine((if (question.image != null) "Photo: " else "You: ") + question.text),
+                  style = TextStyle.META,
+                  color = TextColor.SECONDARY,
+              )
+              text(
+                  pages.getOrNull(replyPage) ?: "Thinking…",
+                  style = TextStyle.BODY,
+                  color = if (reply?.failed == true) TextColor.SECONDARY else TextColor.PRIMARY,
+              )
+              val footer =
+                  when {
+                    streaming && pages.isEmpty() -> null
+                    streaming -> "Grok is writing…"
+                    reply?.failed == true -> "Couldn't reach Grok"
+                    pages.size > 1 -> "Page ${replyPage + 1} of ${pages.size}"
+                    else -> null
+                  }
+              footer?.let { text(it, style = TextStyle.META, color = TextColor.SECONDARY) }
+            }
+          }
         }
         flexBox(
             direction = Direction.ROW,
-            gap = 8,
+            alignment = Alignment.CENTER,
+            crossAlignment = Alignment.CENTER,
+        ) {
+          buttonGroup {
+            if (streaming) {
+              button("Stop", style = ButtonStyle.SECONDARY, onClick = { stopReply() })
+            } else {
+              if (canPhoto) {
+                button("Photo", style = ButtonStyle.PRIMARY, onClick = { capture() })
+              }
+              if (pages.size > 1) {
+                button(
+                    if (replyPage == pages.size - 1) "From start" else "More",
+                    style = if (canPhoto) ButtonStyle.SECONDARY else ButtonStyle.PRIMARY,
+                    onClick = {
+                      replyPage = (replyPage + 1) % pages.size
+                      refreshGlasses(now = true)
+                    },
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** After a glasses photo: send it with the default question, or drop it. */
+  private fun showPhotoReady() {
+    val p = _pendingPhoto.value ?: return showChat()
+    send {
+      flexBox(direction = Direction.COLUMN, gap = 12) {
+        flexBox(padding = 24, gap = 8, background = FlexBoxBackground.CARD) {
+          text("Photo ready", style = TextStyle.HEADING)
+          text("Send it to Grok, or add a question on your phone.", style = TextStyle.BODY)
+          text("${p.width}×${p.height}", style = TextStyle.META, color = TextColor.SECONDARY)
+        }
+        flexBox(
+            direction = Direction.ROW,
             alignment = Alignment.CENTER,
             crossAlignment = Alignment.CENTER,
         ) {
           buttonGroup {
             button(
-                "Tap me",
+                "Send",
                 style = ButtonStyle.PRIMARY,
                 iconName = IconName.CHECKMARK,
-                onClick = {
-                  _ui.update { it.copy(tapCount = it.tapCount + 1) }
-                  showHello()
-                },
+                onClick = { sendMessage("") },
             )
             button(
-                "Refresh",
+                "Discard",
                 style = ButtonStyle.SECONDARY,
-                onClick = { showHello() },
+                onClick = {
+                  _pendingPhoto.value = null
+                  currentScreen = ::showChat
+                  refreshGlasses(now = true)
+                },
             )
           }
         }
@@ -549,39 +662,25 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     }
   }
 
-  private fun showCaptured() {
-    val p = _photo.value
-    send {
-      flexBox(direction = Direction.COLUMN, gap = 12) {
-        flexBox(padding = 24, background = FlexBoxBackground.CARD) {
-          text("Photo captured", style = TextStyle.HEADING)
-          text(
-              if (p != null) "${p.bitmap.width}×${p.bitmap.height}, ${p.bytes / 1024} KB"
-              else "No photo",
-              style = TextStyle.BODY,
-          )
-          text(
-              "Send it to Grok from the phone",
-              style = TextStyle.META,
-              color = TextColor.SECONDARY,
-          )
-        }
-        flexBox(
-            direction = Direction.ROW,
-            alignment = Alignment.CENTER,
-            crossAlignment = Alignment.CENTER,
-        ) {
-          buttonGroup {
-            button(
-                "New photo",
-                style = ButtonStyle.PRIMARY,
-                iconName = IconName.CHECKMARK,
-                onClick = { capture() },
-            )
-          }
-        }
+  private fun oneLine(text: String, max: Int = 44): String {
+    val flat = text.replace(Regex("\\s+"), " ").trim()
+    return if (flat.length <= max) flat else flat.take(max - 1).trimEnd() + "…"
+  }
+
+  /** Splits a reply into pages of whole words that fit the card (about 8 lines). */
+  private fun pages(text: String, max: Int = 230): List<String> {
+    val out = mutableListOf<String>()
+    val page = StringBuilder()
+    for (word in text.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
+      if (page.isNotEmpty() && page.length + 1 + word.length > max) {
+        out += page.toString()
+        page.clear()
       }
+      if (page.isNotEmpty()) page.append(' ')
+      page.append(word)
     }
+    if (page.isNotEmpty()) out += page.toString()
+    return out
   }
 
   private fun send(content: ContentScope.() -> Unit) {
