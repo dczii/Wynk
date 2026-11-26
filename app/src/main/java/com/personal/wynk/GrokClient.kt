@@ -18,6 +18,9 @@ import org.json.JSONObject
 class GrokClient(
     private val apiKey: String,
     private val model: String = "grok-4.7",
+    // grok-4.7 reasons before answering. "low" cuts the first words from ~11 s to ~3 s,
+    // which matters when you're waiting on the glasses.
+    private val reasoningEffort: String? = "low",
 ) {
   class GrokException(message: String) : IOException(message)
 
@@ -29,6 +32,7 @@ class GrokClient(
             JSONObject()
                 .put("model", model)
                 .put("stream", true)
+                .apply { reasoningEffort?.let { put("reasoning_effort", it) } }
                 .put("messages", messages)
                 .toString()
 
